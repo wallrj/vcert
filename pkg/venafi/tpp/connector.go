@@ -21,13 +21,14 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"github.com/Venafi/vcert/v4/pkg/util"
 	"log"
 	"net/http"
 	neturl "net/url"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/Venafi/vcert/v4/pkg/util"
 
 	"github.com/Venafi/vcert/v4/pkg/certificate"
 	"github.com/Venafi/vcert/v4/pkg/endpoint"
@@ -934,9 +935,14 @@ func (c *Connector) SetHTTPClient(client *http.Client) {
 	c.client = client
 }
 
-func (c *Connector) ListCertificates(filter endpoint.Filter) ([]certificate.CertificateInfo, error) {
+type internalCertificateVisitor interface {
+	initialize(sumLen int)
+	visit(int, internalCertificate) error
+}
+
+func (c *Connector) visitInternalCertificates(filter endpoint.Filter, v internalCertificateVisitor) error {
 	if c.zone == "" {
-		return nil, fmt.Errorf("empty zone")
+		return fmt.Errorf("empty zone")
 	}
 	min := func(i, j int) int {
 		if i < j {
@@ -949,13 +955,11 @@ func (c *Connector) ListCertificates(filter endpoint.Filter) ([]certificate.Cert
 	if filter.Limit != nil {
 		limit = *filter.Limit
 	}
-	var buf [][]certificate.CertificateInfo
+	var buf [][]internalCertificate
 	for offset := 0; limit > 0; limit, offset = limit-batchSize, offset+batchSize {
-		var b []certificate.CertificateInfo
-		var err error
-		b, err = c.getCertsBatch(offset, min(limit, batchSize), filter.WithExpired)
+		b, err := c.getCertsBatch(offset, min(limit, batchSize), filter.WithExpired)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		buf = append(buf, b)
 		if len(b) < min(limit, batchSize) {
@@ -966,16 +970,53 @@ func (c *Connector) ListCertificates(filter endpoint.Filter) ([]certificate.Cert
 	for _, b := range buf {
 		sumLen += len(b)
 	}
-	infos := make([]certificate.CertificateInfo, sumLen)
-	offset := 0
-	for _, b := range buf {
-		copy(infos[offset:], b[:])
-		offset += len(b)
+	v.initialize(sumLen)
+	for batchNumber, batch := range buf {
+		for batchIndex, batchItem := range batch {
+			i := (batchNumber * batchSize) + batchIndex
+			batchItem.X509.ID = batchItem.DN
+			if err := v.visit(i, batchItem); err != nil {
+				return err
+			}
+		}
 	}
-	return infos, nil
+	return nil
 }
 
-func (c *Connector) getCertsBatch(offset, limit int, withExpired bool) ([]certificate.CertificateInfo, error) {
+type listCertificatesVisitor struct {
+	infos []certificate.CertificateInfo
+}
+
+var _ internalCertificateVisitor = &listCertificatesVisitor{}
+
+func (o *listCertificatesVisitor) initialize(sumLen int) {
+	o.infos = make([]certificate.CertificateInfo, sumLen)
+}
+
+func (o *listCertificatesVisitor) visit(i int, cert internalCertificate) error {
+	o.infos[i] = cert.X509
+	return nil
+}
+
+func (c *Connector) ListCertificates(filter endpoint.Filter) ([]certificate.CertificateInfo, error) {
+	var visitor listCertificatesVisitor
+	if err := c.visitInternalCertificates(filter, &visitor); err != nil {
+		return nil, err
+	}
+	return visitor.infos, nil
+}
+
+type internalCertificate struct {
+	DN   string
+	Guid string
+	X509 certificate.CertificateInfo
+}
+
+type internalCertificatesResponse struct {
+	Certificates []internalCertificate
+}
+
+func (c *Connector) getCertsBatch(offset, limit int, withExpired bool) ([]internalCertificate, error) {
 	url := urlResourceCertificatesList + urlResource(
 		"?ParentDNRecursive="+neturl.QueryEscape(getPolicyDN(c.zone))+
 			"&limit="+fmt.Sprintf("%d", limit)+
@@ -990,22 +1031,13 @@ func (c *Connector) getCertsBatch(offset, limit int, withExpired bool) ([]certif
 	if statusCode != 200 {
 		return nil, fmt.Errorf("can`t get certificates list: %d %s\n%s", statusCode, status, string(body))
 	}
-	var r struct {
-		Certificates []struct {
-			DN   string
-			X509 certificate.CertificateInfo
-		}
-	}
+	var r internalCertificatesResponse
+
 	err = json.Unmarshal(body, &r)
 	if err != nil {
 		return nil, err
 	}
-	infos := make([]certificate.CertificateInfo, len(r.Certificates))
-	for i, c := range r.Certificates {
-		c.X509.ID = c.DN
-		infos[i] = c.X509
-	}
-	return infos, nil
+	return r.Certificates, nil
 }
 
 func parseHostPort(s string) (host string, port string, err error) {
@@ -1108,4 +1140,40 @@ func (c *Connector) configDNToGuid(objectDN string) (guid string, err error) {
 	}
 	return resp.GUID, nil
 
+}
+
+func (c *Connector) deleteCertificate(guid string) error {
+	statusCode, _, body, err := c.request("DELETE", urlResourceCertificate+urlResource(guid), nil)
+	if err != nil {
+		return err
+	}
+	if statusCode != http.StatusOK {
+		return fmt.Errorf("unexpected response status %d: %s", statusCode, string(body))
+	}
+	return nil
+}
+
+type deleteCertificatesVisitor struct {
+	*Connector
+}
+
+var _ internalCertificateVisitor = &deleteCertificatesVisitor{}
+
+func (o *deleteCertificatesVisitor) initialize(sumLen int) {
+	fmt.Println("Certificates to be deleted:", sumLen)
+}
+
+func (o *deleteCertificatesVisitor) visit(i int, cert internalCertificate) error {
+	fmt.Println(i, cert.DN)
+	return o.Connector.deleteCertificate(cert.Guid)
+}
+
+func (c *Connector) DeleteCertificates(filter endpoint.Filter) error {
+	deleter := deleteCertificatesVisitor{
+		Connector: c,
+	}
+	if err := c.visitInternalCertificates(filter, &deleter); err != nil {
+		return err
+	}
+	return nil
 }
